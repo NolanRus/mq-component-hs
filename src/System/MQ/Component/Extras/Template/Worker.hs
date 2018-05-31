@@ -6,12 +6,13 @@ module System.MQ.Component.Extras.Template.Worker
   , workerScheduler
   ) where
 
-import           Control.Exception                         (Exception,
-                                                            SomeException (..),
+import           Control.Exception                         (Exception(..), SomeException,
                                                             catch)
 import           Control.Monad                             (when)
 import           Control.Monad.Except                      (liftIO)
 import           Control.Monad.State.Strict                (get)
+import           System.Log.Logger                         (errorM)
+import           Data.List                                 (findIndex, isPrefixOf, tails)
 import           System.MQ.Component.Extras.Template.Types (MQActionS)
 import           System.MQ.Component.Internal.Atomic       (updateLastMsgId)
 import           System.MQ.Component.Internal.Config       (load2Channels,
@@ -25,7 +26,7 @@ import           System.MQ.Monad                           (MQMonadS,
                                                             foreverSafe,
                                                             runMQMonadS)
 import           System.MQ.Protocol                        (Condition (..),
-                                                            Hash, Message (..),
+                                                            Message (..),
                                                             MessageLike (..),
                                                             MessageTag,
                                                             Props (..),
@@ -73,14 +74,14 @@ worker wType action env@Env{..} = do
     (msgReceiver, schedulerIn) <- msgRecieverAndSchedulerIn
 
     foreverSafe name $ do
-        (tag, Message{..}) <- msgReceiver
+        (tag, msg@Message{..}) <- msgReceiver
         state <- get
         when (checkTag tag) $ do
             -- Set 'lastMsgId' to id of message that worker will process
             updateLastMsgId msgId atomic
 
             -- Process data from message using 'action'
-            unpackM msgData >>= processTask state schedulerIn msgId
+            processTask state schedulerIn msg
 
             -- After message has been processed, clear 'lastMsgId'
             updateLastMsgId emptyHash atomic
@@ -98,18 +99,28 @@ worker wType action env@Env{..} = do
     checkTag :: MessageTag -> Bool
     checkTag = (`matches` (messageSpec :== spec messageProps :&& messageType :== mtype messageProps))
 
-    processTask :: s -> PushChannel -> Hash -> a -> MQMonadS s ()
-    processTask state schedulerIn curId config = do
-        -- Runtime errors may occur during execution of 'WorkerAction'. In order to process them
-        -- without failures we use function 'handleError' that turns 'IOException's into 'MQError's
-        responseE <- liftIO $ handleError state $ action env config
+    processTask :: s -> PushChannel -> Message -> MQMonadS s ()
+    processTask state schedulerIn Message{..} = do
+        -- Runtime errors may occur during message parsing and execution of 'WorkerAction'. In order to process them
+        -- without failures we use function 'handleError' that converts 'Exception's into 'MQError's
+        responseE <- liftIO . handleError state $ (unpackM msgData >>= action env)
 
         case responseE of
-          Right response -> createMessage curId creator notExpires response >>= push schedulerIn
-          Left  e        -> createMessage curId creator notExpires (MQError errorComponent $ toMeaningfulError e) >>= push schedulerIn
+          Right response      -> createMessage msgId creator notExpires response >>= push schedulerIn
+          Left  (MQError c m) -> createMessage msgId creator notExpires (MQError c $ dropCallStack m) >>= push schedulerIn
 
-    handleError :: s -> MQMonadS s b -> IO (Either SomeException b)
-    handleError state valM = (Right . fst <$> runMQMonadS valM state) `catch` (return . Left)
+    handleError :: s -> MQMonadS s b -> IO (Either MQError b)
+    handleError state valM = catch (Right . fst <$> runMQMonadS valM state) handler
+      where
+        handler :: SomeException -> IO (Either MQError b)
+        handler e = do
+            errorM name $! show e
+            let anyError = MQError errorComponent $ show e
+            return . Left $ maybe anyError id (fromException e :: Maybe MQError)
 
-    toMeaningfulError :: Exception e => e -> String
-    toMeaningfulError = show
+            -- case (fromException e :: Maybe MQError) of
+            --   (Just mqErr) -> return . Left $ mqErr
+            --   Nothing -> return . Left . MQError errorComponent $ show e
+
+    dropCallStack :: String -> String
+    dropCallStack str = maybe str (\i -> take i str) $ findIndex (isPrefixOf "\nCallStack") (tails str)
