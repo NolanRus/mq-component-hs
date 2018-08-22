@@ -10,7 +10,7 @@ import           ExampleRadioTypes      (RadioData (..))
 import           System.MQ.Component    (Env (..), TwoChannels (..),
                                          load2Channels, runApp)
 import           System.MQ.Monad        (MQMonad)
-import           System.MQ.Protocol     (createMessage, emptyHash, notExpires)
+import           System.MQ.Protocol     (createMessage, emptyId, notExpires)
 import           System.MQ.Transport    (push)
 
 main :: IO ()
@@ -23,7 +23,7 @@ radioSpeaker :: Env -> MQMonad ()
 radioSpeaker Env{..} = do
     TwoChannels{..} <- load2Channels
     forever $ do
-        msg <- createMessage emptyHash creator notExpires $ RadioData "Good morning, Vietnam! This is example_radio-speaker-hs!"
+        msg <- createMessage emptyId creator notExpires $ RadioData "Good morning, Vietnam! This is example_radio-speaker-hs!"
 
         push toScheduler msg
         liftIO $ print msg

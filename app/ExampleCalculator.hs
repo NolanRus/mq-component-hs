@@ -21,9 +21,9 @@ main = runApp "example_calculator-hs" $ workerScheduler calculatorWorkerAction
 -- returns result of that multiplication in 'CalculatorResult'.
 --
 calculatorWorkerAction :: MQAction CalculatorConfig CalculatorResult
-calculatorWorkerAction Env{..} CalculatorConfig{..} = do
+calculatorWorkerAction Env{..} c@CalculatorConfig{..} = do
     -- log messages can be written this way
-    liftIO $ infoM name "Info log message"
+    liftIO . infoM name $ "Info log message: get config " ++ show c
     case action of
       -- this error will be caught by worker template
       "-" -> error "we can't subtract"

@@ -7,7 +7,6 @@ module System.MQ.Component.Extras.Template.Listener
   ) where
 
 import           Control.Monad                             (when)
-import           Data.String                               (fromString)
 import           System.MQ.Component.Extras.Template.Types (MQActionVoidS)
 import           System.MQ.Component.Internal.Atomic       (updateLastMsgId)
 import           System.MQ.Component.Internal.Config       (load2Channels,
@@ -20,12 +19,12 @@ import           System.MQ.Protocol                        (Condition (..),
                                                             Message (..),
                                                             MessageLike (..),
                                                             MessageTag,
-                                                            Props (..),
-                                                            emptyHash, matches,
+                                                            Props (..), emptyId,
+                                                            matches,
                                                             messageSpec,
                                                             messageType)
-import           System.MQ.Transport                       (SubChannel, sub)
-
+import           System.MQ.Transport                       (SubChannel,
+                                                            Subscribe (..), sub)
 
 -- | Listener of communication level's scheduler
 --
@@ -39,8 +38,13 @@ listenerTech analyser env = loadTechChannels >>= listenerWithChannels analyser e
 
 -- | Template `listener` allows user to gather data from queue and perform different actions with it
 --
-listenerWithChannels :: MessageLike a => MQActionVoidS s a -> Env -> TwoChannels -> MQMonadS s ()
-listenerWithChannels analyser env@Env{..} TwoChannels{..} = foreverSafe name $ obtainData env fromScheduler analyser
+listenerWithChannels :: forall a s. MessageLike a => MQActionVoidS s a -> Env -> TwoChannels -> MQMonadS s ()
+listenerWithChannels analyser env@Env{..} TwoChannels{..} = do
+    subscribeToTypeSpec fromScheduler (mtype messageProps) (spec messageProps)
+    foreverSafe name $ obtainData env fromScheduler analyser
+  where
+    messageProps :: Props a
+    messageProps = props
 
 -- | Receive from queue message with given type, spec and pId and process it using 'MQActionVoid'
 --
@@ -56,14 +60,11 @@ obtainData env@Env{..} subChannel analyser = do
       unpackM msgData >>= analyser env
 
       -- After message has been processed, clear 'lastMsgId'
-      updateLastMsgId emptyHash atomic
+      updateLastMsgId emptyId atomic
 
   where
     Props{..} = props :: Props a
 
-    mType = mtype
-    mSpec = fromString spec
-
     filterTag :: MessageTag -> Bool
-    filterTag = (`matches` (messageType :== mType :&& messageSpec :== mSpec))
+    filterTag = (`matches` (messageType :== mtype :&& messageSpec :== spec))
 

@@ -27,12 +27,12 @@ import           System.MQ.Component.Internal.Atomic.Types (Atomic (..),
 import           System.MQ.Error                           (MQError (..),
                                                             errorComponent)
 import           System.MQ.Monad                           (MQMonadS)
-import           System.MQ.Protocol                        (Hash, emptyHash)
+import           System.MQ.Protocol                        (Id, emptyId)
 
 -- | Creates new 'Atomic' with information only about communication 'ThreadId'.
 --
 createAtomic :: ThreadId -> Atomic
-createAtomic tid = Atomic tid True "" emptyHash
+createAtomic tid = Atomic tid True "" emptyId
 
 -- | Creates 'Atomic' in monad.
 --
@@ -51,20 +51,20 @@ updateMessage ms atomic = liftIO $ modifyMVar_ atomic (pure . set message ms)
 
 -- | Updates lastMsg field in 'Atomic'.
 --
-updateLastMsgId  :: MonadIO m => Hash -> MVar Atomic -> m ()
+updateLastMsgId  :: MonadIO m => Id -> MVar Atomic -> m ()
 updateLastMsgId lmsg atomic = liftIO $ modifyMVar_ atomic (pure . set lastMsgId lmsg)
 
 -- | Returns lastMsg from 'Atomic'.
 --
-tryLastMsgId :: MonadIO m => MVar Atomic -> m (Maybe Hash)
+tryLastMsgId :: MonadIO m => MVar Atomic -> m (Maybe Id)
 tryLastMsgId = (liftIO . tryReadMVar) >=> pure . fmap (view lastMsgId)
 
 -- | Returns lastMsg from 'Atomic'. Throws an error if 'Atomic' is empty.
 --
-getLastMsgId :: forall s. MVar Atomic -> MQMonadS s Hash
+getLastMsgId :: forall s. MVar Atomic -> MQMonadS s Id
 getLastMsgId = fromMMQ . tryLastMsgId
   where
-    fromMMQ :: MQMonadS s (Maybe Hash) -> MQMonadS s Hash
+    fromMMQ :: MQMonadS s (Maybe Id) -> MQMonadS s Id
     fromMMQ = (maybe (throwError $ MQError errorComponent "can't get message id from atomic") pure =<<)
 
 -- | Returns isAlive from 'Atomic' if possible.

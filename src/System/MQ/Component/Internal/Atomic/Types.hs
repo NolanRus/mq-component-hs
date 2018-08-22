@@ -11,7 +11,7 @@ module System.MQ.Component.Internal.Atomic.Types
 
 import           Control.Concurrent (ThreadId)
 import           Control.Lens.TH    (makeLenses)
-import           System.MQ.Protocol (Hash)
+import           System.MQ.Protocol (Id)
 
 
 -- | 'IsAlive' is the state for the communication layer's thread, which can be in two states: running or down.
@@ -23,7 +23,7 @@ type IsAlive = Bool
 data Atomic = Atomic { _threadId  :: ThreadId -- ^ communication layer's 'ThreadId'
                      , _isAlive   :: IsAlive  -- ^ shows whether communication thread is alive
                      , _message   :: String   -- ^ some useful messages for monitoring from communication layer
-                     , _lastMsgId :: Hash     -- ^ id of last message that was received on communication level
+                     , _lastMsgId :: Id       -- ^ id of last message that was received on communication level
                      }
   deriving (Show, Eq, Ord)
 

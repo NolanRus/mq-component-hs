@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/)
 and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.html).
 
+## [0.1.4.0] - 2018-08-21
+### Changed
+- Updated protocol (mq version 0.1.6.0).
+- Example `ExampleRadioListener` splitted into 2 examples: with detailed example and with worker pattern using example.
+
 ## [0.1.3.2] - 2018-05-29
 ### Added
 - Added validation and error catching function

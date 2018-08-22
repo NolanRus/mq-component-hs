@@ -3,17 +3,40 @@
 
 module Main where
 
-import           Control.Monad.IO.Class     (liftIO)
-import           ExampleRadioTypes          (RadioData (..))
-import           System.MQ.Component        (runApp)
-import           System.MQ.Component.Extras (MQActionVoid, listenerComm)
+import           Control.Monad          (when)
+import           Control.Monad.IO.Class (liftIO)
+import           ExampleRadioTypes      (RadioData (..))
+import           System.MQ.Component    (Env (..), TwoChannels (..),
+                                         load2Channels, runApp)
+import           System.MQ.Monad
+import           System.MQ.Protocol
+import           System.MQ.Transport
 
 main :: IO ()
-main = runApp "example_radio-listener-hs" $ listenerComm radioListener
+main = runApp "example_radio-listener-hs" app
 
--- | To use template 'Listener' we just need to define function of type 'MQActionVoid'
--- that will process messages received from queue. Our listener will receive messages
--- of type 'RadioData' and print their content.
---
-radioListener :: MQActionVoid RadioData
-radioListener _ RadioData{..} = liftIO $ putStrLn $ "I heard something on a radio: " ++ message
+app :: Env -> MQMonadS () ()
+app Env{..} = do
+  TwoChannels from _ <- load2Channels
+  -- Following line is equal to `subscribeTo from "data:example_radio"`.
+  -- It is equal to subscribe to all messages that starts with "data:example_radio".
+  subscribeToTypeSpec from (mtype messageProps) (spec messageProps)
+
+  foreverSafe name $ do
+      -- receive message
+      (tag, Message{..}) <- sub from
+      -- be sure that tag is correct
+      when (checkTag tag) $ do
+          -- unpack data from the message
+          unpacked <- unpackM msgData
+          -- and process it
+          process unpacked
+  where
+    messageProps :: Props RadioData
+    messageProps = props
+
+    checkTag :: MessageTag -> Bool
+    checkTag = (`matches` (messageSpec :== spec messageProps :&& messageType :== mtype messageProps))
+
+    process :: RadioData -> MQMonadS () ()
+    process RadioData{..} = liftIO $ putStrLn $ "I heard something on a radio: " ++ message

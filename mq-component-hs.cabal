@@ -1,5 +1,5 @@
 name:                mq-component-hs
-version:             0.1.3.2
+version:             0.1.4.0
 synopsis:            Package with monique component
 description:
   The package covers:
@@ -72,6 +72,17 @@ executable example-radio-speaker
 executable example-radio-listener
   hs-source-dirs:      app
   main-is:             ExampleRadioListener.hs
+  other-modules:       ExampleRadioTypes
+  build-depends:       base
+                     , aeson
+                     , mq
+                     , mq-component-hs
+  default-language:    Haskell2010
+  ghc-options:         -threaded -rtsopts -with-rtsopts=-N -Wall -O2
+
+executable example-radio-listener-2
+  hs-source-dirs:      app
+  main-is:             ExampleRadioListener2.hs
   other-modules:       ExampleRadioTypes
   build-depends:       base
                      , aeson

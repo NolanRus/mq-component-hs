@@ -45,7 +45,10 @@ stack exec example-radio-speaker
 stack exec example-radio-listener
 ```
 
-Можно обратить внимание на то, что получатель сообщений реализован с использованием [соответствующего](src/System/MQ/Component/Extras/Template/Listener.hs) шаблона.
+Тот же самый получаеть, который реализован с помощью [соответствующего](src/System/MQ/Component/Extras/Template/Listener.hs) шаблона, находится в [этом](app/ExampleRadioListener2.hs) файле и запускается с помощью команды
+```
+stack exec example-radio-listener-2
+```
 
 ### Пример "калькулятор"
 
@@ -139,4 +142,6 @@ stack exec example-clock-ask
   * [Формирование ошибки](src/System/MQ/Component/Extras/Error.hs)
   * [Вызов "удалённого" компонента](src/System/MQ/Component/Extras/Foreign.hs)
   * [Набор шаблонов для поведения](src/System/MQ/Component/Extras/Template)
+  
+Подписка на различные тэги сообщений для языка Haskell реализована в базовой библиотеке [mq](https://github.com/biocad/mq). 
 

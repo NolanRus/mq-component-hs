@@ -6,13 +6,15 @@ module System.MQ.Component.Extras.Template.Worker
   , workerScheduler
   ) where
 
-import           Control.Exception                         (Exception(..), SomeException,
+import           Control.Exception                         (Exception (..),
+                                                            SomeException,
                                                             catch)
 import           Control.Monad                             (when)
 import           Control.Monad.Except                      (liftIO)
 import           Control.Monad.State.Strict                (get)
+import           Data.List                                 (findIndex,
+                                                            isPrefixOf, tails)
 import           System.Log.Logger                         (errorM)
-import           Data.List                                 (findIndex, isPrefixOf, tails)
 import           System.MQ.Component.Extras.Template.Types (MQActionS)
 import           System.MQ.Component.Internal.Atomic       (updateLastMsgId)
 import           System.MQ.Component.Internal.Config       (load2Channels,
@@ -31,12 +33,13 @@ import           System.MQ.Protocol                        (Condition (..),
                                                             MessageTag,
                                                             Props (..),
                                                             createMessage,
-                                                            emptyHash, matches,
+                                                            emptyId, matches,
                                                             messageSpec,
                                                             messageType,
                                                             notExpires)
-import           System.MQ.Transport                       (PushChannel, pull,
-                                                            push, sub)
+import           System.MQ.Transport                       (PushChannel,
+                                                            Subscribe (..),
+                                                            pull, push, sub)
 
 -- | Given 'WorkerAction' acts as component's communication layer that receives messages of type 'a'
 -- from scheduler, processes them using 'WorkerAction' and sends result of type 'b' back to scheduler.
@@ -84,13 +87,16 @@ worker wType action env@Env{..} = do
             processTask state schedulerIn msg
 
             -- After message has been processed, clear 'lastMsgId'
-            updateLastMsgId emptyHash atomic
+            updateLastMsgId emptyId atomic
 
   where
     msgRecieverAndSchedulerIn :: MQMonadS s (MessageReceiver s, PushChannel)
     msgRecieverAndSchedulerIn =
       case wType of
-        Scheduler  -> (\(TwoChannels fs ts) -> (sub fs, ts)) <$> load2Channels
+        Scheduler  -> do
+             (TwoChannels fs ts) <- load2Channels
+             subscribeToTypeSpec fs (mtype messageProps) (spec messageProps)
+             pure (sub fs, ts)
         Controller -> (\(ThreeChannels _ ts fc) -> (pull fc, ts)) <$> load3Channels name
 
     messageProps :: Props a

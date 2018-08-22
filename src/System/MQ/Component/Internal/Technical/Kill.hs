@@ -10,9 +10,8 @@ import           Control.Concurrent                  (killThread)
 import           Control.Concurrent.MVar             (takeMVar)
 import           Control.Monad                       (when)
 import           Control.Monad.Except                (liftIO)
-import qualified Data.ByteString.Char8               as BSC8 (unpack)
 import           Data.Maybe                          (fromJust)
-import           Data.String                         (fromString)
+import           Data.Text                           as T (unpack)
 import           System.Log.Logger                   (infoM)
 import           System.MQ.Component.Internal.Atomic (Atomic (..), tryLastMsgId)
 import           System.MQ.Component.Internal.Config (loadTechChannels)
@@ -50,7 +49,7 @@ processKill Env{..} = do
              Atomic{..} <- liftIO $ takeMVar atomic
              -- kill communication thread (it will be restarted later by main thread)
              liftIO $ killThread _threadId
-             liftIO $ infoM name ("TECHNICAL: task " ++ BSC8.unpack (fromJust curMsgId) ++ " killed")
+             liftIO $ infoM name ("TECHNICAL: task " ++ T.unpack (fromJust curMsgId) ++ " killed")
 
   where
-    killSpec = fromString $ spec (props :: Props KillConfig)
+    killSpec = spec (props :: Props KillConfig)

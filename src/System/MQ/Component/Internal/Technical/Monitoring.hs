@@ -12,7 +12,7 @@ import           System.MQ.Component.Internal.Config (loadTechChannels)
 import           System.MQ.Component.Internal.Env    (Env (..),
                                                       TwoChannels (..))
 import           System.MQ.Monad                     (MQMonad, foreverSafe)
-import           System.MQ.Protocol                  (createMessage, emptyHash,
+import           System.MQ.Protocol                  (createMessage, emptyId,
                                                       getTimeMillis, notExpires)
 import           System.MQ.Protocol.Technical        (MonitoringData (..))
 import           System.MQ.Transport                 (push)
@@ -31,7 +31,7 @@ processMonitoring Env{..} = do
 
         let monResult = MonitoringData currentTime name curStatus curMessage
 
-        msg <- createMessage emptyHash creator notExpires monResult
+        msg <- createMessage emptyId creator notExpires monResult
         push toScheduler msg
 
   where
