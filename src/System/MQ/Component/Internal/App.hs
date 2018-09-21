@@ -51,6 +51,7 @@ import           System.MQ.Transport                               (PushChannel,
                                                                     SubChannel,
                                                                     sub,
                                                                     push)
+import           System.MQ.Encoding.MessagePack                    (pack)
 import           Control.Concurrent.Chan.Unagi                     
 
 technicalPart :: MQMonad ()
@@ -75,7 +76,7 @@ technicalPart = do
     startSendingMessagesToScheduler toScheduler techChanOut = do
         liftIO $ forkIO $ processMQError $ do
             foreverSafe "tech-orchestrator-sender" $ do
-                msg <- liftIO $ readChan techChanOut
+                (tag, msg) <- liftIO $ readChan techChanOut
                 push toScheduler msg
         pure ()
 
