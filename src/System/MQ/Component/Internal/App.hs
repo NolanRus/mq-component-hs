@@ -17,6 +17,7 @@ import           Control.Concurrent.MVar                           (isEmptyMVar,
                                                                     putMVar)
 import           Control.Monad                                     (forever,
                                                                     when)
+import           Data.Text                                          as T (unpack)
 import           Control.Monad.Except                              (catchError)
 import           Control.Monad.IO.Class                            (liftIO)
 import           System.Log.Formatter                              (simpleLogFormatter)
@@ -27,17 +28,129 @@ import           System.Log.Logger                                 (Priority (..
                                                                     infoM,
                                                                     setLevel,
                                                                     updateGlobalLogger)
-import           System.MQ.Component.Internal.Atomic               (createAtomic)
-import           System.MQ.Component.Internal.Config               (loadEnv)
+import           System.MQ.Component.Internal.Atomic               (createAtomic, 
+                                                                    Atomic (..), 
+                                                                    tryLastMsgId)
+import           System.MQ.Component.Internal.Config               (loadEnv,
+                                                                    loadTechChannels,
+                                                                    load2Channels)
 import           System.MQ.Component.Internal.Env                  (Env (..),
-                                                                    Name)
+                                                                    Name,
+                                                                    TwoChannels (..))
 import           System.MQ.Component.Internal.Technical.Kill       (processKill)
 import           System.MQ.Component.Internal.Technical.Monitoring (processMonitoring)
+import           System.MQ.Protocol                                (Message (..), MessageTag, MessageLike)
+import           System.MQ.Protocol.Technical                      (KillConfig (..))
 import           System.MQ.Monad                                   (MQMonad,
                                                                     MQMonadS,
                                                                     errorHandler,
                                                                     runMQMonad,
-                                                                    runMQMonadS)
+                                                                    runMQMonadS,
+                                                                    foreverSafe)
+import           System.MQ.Transport                               (PushChannel,
+                                                                    SubChannel,
+                                                                    sub,
+                                                                    push)
+import           Control.Concurrent.Chan.Unagi                     
+
+technicalPart :: MQMonad ()
+technicalPart = do
+    (mainChanIn, mainChanOut) <- liftIO $ newChan
+    (techChanIn, techChanOut) <- liftIO $ newChan
+    TwoChannels{..} <- loadTechChannels
+    startCollectingMessagesFromScheduler fromScheduler techChanIn
+    startSendingMessagesToScheduler toScheduler techChanOut
+    startKillMessageHandling techChanOut
+    startMonitoring mainChanIn
+  where
+    startCollectingMessagesFromScheduler :: SubChannel -> InChan (MessageTag, Message) -> MQMonad ()
+    startCollectingMessagesFromScheduler fromScheduler techChanIn = do
+        liftIO $ forkIO $ processMQError $ do
+            foreverSafe "tech-orchestrator-collector" $ do
+                msg <- sub fromScheduler
+                liftIO $ writeChan techChanIn msg
+        pure ()
+
+    startSendingMessagesToScheduler :: PushChannel -> OutChan (MessageTag, Message) -> MQMonad ()
+    startSendingMessagesToScheduler toScheduler techChanOut = do
+        liftIO $ forkIO $ processMQError $ do
+            foreverSafe "tech-orchestrator-sender" $ do
+                msg <- liftIO $ readChan techChanOut
+                push toScheduler msg
+        pure ()
+
+    startKillMessageHandling :: OutChan (MessageTag, Message) -> MQMonad ()
+    startKillMessageHandling techChanOut = do
+        liftIO $ forkIO $ processMQError $ do 
+           foreverSafe "kill-handler" $ do
+                -- listen technical queue
+                (tag, Message{..}) <- liftIO $ readChan techChanOut
+                -- if reveive 'KillConfig' message then...
+                when (tag `matches` (messageType :== Config :&& messageSpec :== killSpec)) $ do
+                  -- unpack message
+                  KillConfig{..} <- unpackM msgData
+                  -- get current task ID
+                  curMsgId <- tryLastMsgId atomic
+                  -- if current task ID is the same as in received message then...
+                  when (curMsgId == Just killTaskId) $ do
+                      -- get atomic 'MVar'
+                      Atomic{..} <- liftIO $ takeMVar atomic
+                      -- kill communication thread (it will be restarted later by main thread)
+                      liftIO $ killThread _threadId
+                      liftIO $ infoM name ("TECHNICAL: task " ++ T.unpack (fromJust curMsgId) ++ " killed")
+        pure ()
+
+    startMonitoring :: InChan (MessageTag, Message) -> MQMonad ()
+    startMonitoring mainChanIn = do
+        liftIO $ forkIO $ processMQError $ do
+            foreverSafe "monitoring-producer" $ do
+                liftIO $ threadDelay (millisToMicros frequency)
+                currentTime <- getTimeMillis
+                curStatus   <- tryIsAlive atomic >>= maybe (pure False) pure
+                curMessage  <- tryMessage atomic >>= maybe (pure "Communication layer's thread is down") pure
+                let monResult = MonitoringData currentTime name curStatus curMessage
+                msg <- createMessage emptyId creator notExpires monResult
+                writeChan mainChanIn msg
+        pure ()
+
+communicationalPart :: (Message -> IO Message) -> MQMonad ()
+communicationalPart messageHandler = do
+    (mainChanIn, mainChanOut) <- newChan
+    (commChanIn, commChanOut) <- newChan
+    TwoChannels{..} <- load2Channels
+    startCollectingMessagesFromScheduler fromScheduler techChanIn
+    startSendingMessagesToScheduler toScheduler techChanOut
+    foreverSafe "message-handler" $ do   
+        msg <- readChan commChanOut
+        response <- messageHandler msg
+        writeChan commChanIn result
+  where
+    startCollectingMessagesFromScheduler :: SubChannel -> InChan -> MQMonad ()
+    startCollectingMessagesFromScheduler fromScheduler techChanIn = do
+        liftIO $ forkIO $ processMQError $ do
+            foreverSafe "com-orchestrator-collector" $ do
+                msg <- sub fromScheduler
+                writeChan techChanIn
+
+    startSendingMessagesToScheduler :: PushChannel -> OutChan (MessageTag, Message) -> MQMonad ()
+    startSendingMessagesToScheduler toScheduler techChanOut = do
+        liftIO $ forkIO $ processMQError $ do
+            foreverSafe "com-orchestrator-sender" $ do
+                msg <- readChan techChanOut
+                push toScheduler msg
+
+runComponent :: (Message -> MQMonad Message) -> IO ()
+runComponent state messageHandler = do
+    env@Env{..} <- loadEnv name'
+    setupLogger env
+    infoM name "running component..."
+    infoM name "running technical fork..."
+    forkIO $ processMQError $ technicalPart
+    infoM name "running communication fork..."
+    forkIO $ processMQError $ communicationalPart messageHandler
+
+processMQError :: MQMonad () -> IO ()
+processMQError = fmap fst . flip runMQMonadS () . flip catchError (errorHandler "empty")
 
 runApp :: Name -> (Env -> MQMonad ()) -> IO ()
 runApp name' = runAppS name' ()
@@ -63,7 +176,7 @@ runAppWithTechS name' state runComm runCustomTech = do
         atomicIsEmpty <- isEmptyMVar atomic
 
         when atomicIsEmpty $ do
-            infoM name "there is not communication thread, creating new one..."
+            infoM name "there is no communication thread, creating new one..."
             commThreadId <- forkIO $ processMQError state $ runComm env
 
             let newAtomic = createAtomic commThreadId
