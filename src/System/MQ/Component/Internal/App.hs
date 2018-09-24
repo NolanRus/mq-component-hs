@@ -1,3 +1,4 @@
+{-# LANGUAGE OverloadedStrings   #-}
 {-# LANGUAGE RecordWildCards     #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 
@@ -12,12 +13,15 @@ module System.MQ.Component.Internal.App
   ) where
 
 import           Control.Concurrent                                (forkIO,
-                                                                    threadDelay)
+                                                                    threadDelay,
+                                                                    killThread)
 import           Control.Concurrent.MVar                           (isEmptyMVar,
-                                                                    putMVar)
+                                                                    putMVar,
+                                                                    takeMVar)
 import           Control.Monad                                     (forever,
                                                                     when)
 import           Data.Text                                          as T (unpack)
+import           Data.Maybe                                        (fromJust)
 import           Control.Monad.Except                              (catchError)
 import           Control.Monad.IO.Class                            (liftIO)
 import           System.Log.Formatter                              (simpleLogFormatter)
@@ -30,7 +34,9 @@ import           System.Log.Logger                                 (Priority (..
                                                                     updateGlobalLogger)
 import           System.MQ.Component.Internal.Atomic               (createAtomic, 
                                                                     Atomic (..), 
-                                                                    tryLastMsgId)
+                                                                    tryLastMsgId,
+                                                                    tryIsAlive,
+                                                                    tryMessage)
 import           System.MQ.Component.Internal.Config               (loadEnv,
                                                                     loadTechChannels,
                                                                     load2Channels)
@@ -39,8 +45,23 @@ import           System.MQ.Component.Internal.Env                  (Env (..),
                                                                     TwoChannels (..))
 import           System.MQ.Component.Internal.Technical.Kill       (processKill)
 import           System.MQ.Component.Internal.Technical.Monitoring (processMonitoring)
-import           System.MQ.Protocol                                (Message (..), MessageTag, MessageLike)
-import           System.MQ.Protocol.Technical                      (KillConfig (..))
+import           System.MQ.Protocol                                (Message (..), 
+                                                                    MessageTag, 
+                                                                    MessageLike (..), 
+                                                                    Condition (..),
+                                                                    MessageType (..),
+                                                                    Props,
+                                                                    matches,
+                                                                    messageTag,
+                                                                    messageType,
+                                                                    messageSpec,
+                                                                    notExpires,
+                                                                    createMessage,
+                                                                    emptyId,
+                                                                    getTimeMillis,
+                                                                    spec)
+import           System.MQ.Protocol.Technical                      (MonitoringData (..),
+                                                                    KillConfig (..))
 import           System.MQ.Monad                                   (MQMonad,
                                                                     MQMonadS,
                                                                     errorHandler,
@@ -82,6 +103,7 @@ technicalPart = do
 
     startKillMessageHandling :: OutChan (MessageTag, Message) -> MQMonad ()
     startKillMessageHandling techChanOut = do
+        env@Env{..} <- liftIO $ loadEnv "kill-handler"
         liftIO $ forkIO $ processMQError $ do 
            foreverSafe "kill-handler" $ do
                 -- listen technical queue
@@ -100,9 +122,12 @@ technicalPart = do
                       liftIO $ killThread _threadId
                       liftIO $ infoM name ("TECHNICAL: task " ++ T.unpack (fromJust curMsgId) ++ " killed")
         pure ()
+      where
+        killSpec = spec (props :: Props KillConfig)
 
     startMonitoring :: InChan (MessageTag, Message) -> MQMonad ()
     startMonitoring mainChanIn = do
+        env@Env{..} <- liftIO $ loadEnv "monitoring producer"
         liftIO $ forkIO $ processMQError $ do
             foreverSafe "monitoring-producer" $ do
                 liftIO $ threadDelay (millisToMicros frequency)
@@ -110,45 +135,51 @@ technicalPart = do
                 curStatus   <- tryIsAlive atomic >>= maybe (pure False) pure
                 curMessage  <- tryMessage atomic >>= maybe (pure "Communication layer's thread is down") pure
                 let monResult = MonitoringData currentTime name curStatus curMessage
-                msg <- createMessage emptyId creator notExpires monResult
-                writeChan mainChanIn msg
+                msg <- createMessage emptyId "monitoring-producer" notExpires monResult
+                liftIO $ writeChan mainChanIn (messageTag msg, msg)
         pure ()
+      where
+        millisToMicros :: Int -> Int
+        millisToMicros = (*) 1000
 
-communicationalPart :: (Message -> IO Message) -> MQMonad ()
+communicationalPart :: (Message -> MQMonad Message) -> MQMonad ()
 communicationalPart messageHandler = do
-    (mainChanIn, mainChanOut) <- newChan
-    (commChanIn, commChanOut) <- newChan
+    (mainChanIn, mainChanOut) <- liftIO $ newChan
+    (commChanIn, commChanOut) <- liftIO $ newChan
     TwoChannels{..} <- load2Channels
-    startCollectingMessagesFromScheduler fromScheduler techChanIn
-    startSendingMessagesToScheduler toScheduler techChanOut
+    startCollectingMessagesFromScheduler fromScheduler commChanIn
+    startSendingMessagesToScheduler toScheduler commChanOut
     foreverSafe "message-handler" $ do   
-        msg <- readChan commChanOut
+        (tag, msg) <- liftIO $ readChan commChanOut
         response <- messageHandler msg
-        writeChan commChanIn result
+        liftIO $ writeChan commChanIn (messageTag response, response)
   where
-    startCollectingMessagesFromScheduler :: SubChannel -> InChan -> MQMonad ()
-    startCollectingMessagesFromScheduler fromScheduler techChanIn = do
+    startCollectingMessagesFromScheduler :: SubChannel -> InChan (MessageTag, Message) -> MQMonad ()
+    startCollectingMessagesFromScheduler fromScheduler commChanIn = do
         liftIO $ forkIO $ processMQError $ do
             foreverSafe "com-orchestrator-collector" $ do
                 msg <- sub fromScheduler
-                writeChan techChanIn
+                liftIO $ writeChan commChanIn msg
+        pure()
 
     startSendingMessagesToScheduler :: PushChannel -> OutChan (MessageTag, Message) -> MQMonad ()
-    startSendingMessagesToScheduler toScheduler techChanOut = do
+    startSendingMessagesToScheduler toScheduler commChanOut = do
         liftIO $ forkIO $ processMQError $ do
             foreverSafe "com-orchestrator-sender" $ do
-                msg <- readChan techChanOut
+                (tag, msg) <- liftIO $ readChan commChanOut
                 push toScheduler msg
+        pure()
 
-runComponent :: (Message -> MQMonad Message) -> IO ()
-runComponent state messageHandler = do
+runComponent :: Name -> (Message -> MQMonad Message) -> IO ()
+runComponent name' messageHandler = do
     env@Env{..} <- loadEnv name'
-    setupLogger env
+    -- setupLogger env
     infoM name "running component..."
     infoM name "running technical fork..."
     forkIO $ processMQError $ technicalPart
     infoM name "running communication fork..."
     forkIO $ processMQError $ communicationalPart messageHandler
+    pure ()
 
 processMQError :: MQMonad () -> IO ()
 processMQError = fmap fst . flip runMQMonadS () . flip catchError (errorHandler "empty")
