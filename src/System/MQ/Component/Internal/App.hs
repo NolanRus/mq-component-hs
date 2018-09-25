@@ -8,6 +8,9 @@ module System.MQ.Component.Internal.App
     runApp
   , runAppS
   , runAppWithTech
+  , runComponent
+  , liftMQ
+  , CompMonad
   , runTech
   , processKill
   , processMonitoring
@@ -22,7 +25,7 @@ import           Control.Concurrent.MVar                           (isEmptyMVar,
                                                                     takeMVar)
 import           Control.Monad                                     (forever,
                                                                     when)
-import           Control.Monad.Error                               (MonadError(..))
+import           Control.Monad.Except                              (MonadError(..))
 import           Control.Monad.IO.Class                            (MonadIO(..))
 import           Control.Monad.State                               (MonadState(..))
 import           Control.Monad.Reader                              (ReaderT (..),
@@ -80,10 +83,9 @@ import           System.MQ.Transport                               (PushChannel,
                                                                     SubChannel,
                                                                     sub,
                                                                     push)
-import           System.MQ.Encoding.MessagePack                    (pack)
 import           Control.Concurrent.Chan.Unagi                     
 
-newtype CompMonad s a = CompMonad { unCompMonad :: ReaderT Env (MQMonadS s) a }
+newtype CompMonadS s a = CompMonadS (ReaderT Env (MQMonadS s) a)
   deriving ( Monad
            , Functor
            , Applicative
@@ -92,43 +94,48 @@ newtype CompMonad s a = CompMonad { unCompMonad :: ReaderT Env (MQMonadS s) a }
            , MonadError MQError
            , MonadState s)
 
-runCompMonad :: CompMonad s a -> Env -> MQMonadS s a
-runCompMonad (CompMonad reader) = runReaderT reader 
+type CompMonad = CompMonadS ()
 
-liftMQ :: MQMonadS s a -> CompMonad s a 
-liftMQ m = CompMonad $ ReaderT (const m)
+runCompMonadS :: CompMonadS s a -> Env -> MQMonadS s a
+runCompMonadS (CompMonadS r) = runReaderT r 
 
-technicalPart :: CompMonad () ()
+runCompMonad :: CompMonad a -> Env -> MQMonadS () a
+runCompMonad = runCompMonadS 
+
+liftMQ :: MQMonadS s a -> CompMonadS s a 
+liftMQ m = CompMonadS $ ReaderT (const m)
+
+technicalPart :: CompMonad ()
 technicalPart = do
-    (mainChanIn, mainChanOut) <- liftIO $ newChan
-    (techChanIn, techChanOut) <- liftIO $ newChan
-    TwoChannels{..} <- liftMQ $ loadTechChannels
+    (mainChanIn, mainChanOut) <- liftIO newChan
+    (techChanIn, techChanOut) <- liftIO newChan
+    TwoChannels{..} <- liftMQ loadTechChannels
     _ <- startCollectingMessagesFromScheduler fromScheduler techChanIn
-    _ <- startSendingMessagesToScheduler toScheduler techChanOut
+    _ <- startSendingMessagesToScheduler toScheduler mainChanOut
     _ <- startKillMessageHandling techChanOut
     _ <- startMonitoring mainChanIn
     pure ()
   where
-    startCollectingMessagesFromScheduler :: SubChannel -> InChan (MessageTag, Message) -> CompMonad () ThreadId
+    startCollectingMessagesFromScheduler :: SubChannel -> InChan (MessageTag, Message) -> CompMonad ThreadId
     startCollectingMessagesFromScheduler fromScheduler techChanIn = do
         Env{..} <- ask
-        liftIO $ forkIO $ processMQError $ do
+        liftIO $ forkIO $ processMQError $
             foreverSafe name $ do
                 msg <- sub fromScheduler
                 liftIO $ writeChan techChanIn msg
 
-    startSendingMessagesToScheduler :: PushChannel -> OutChan (MessageTag, Message) -> CompMonad () ThreadId
+    startSendingMessagesToScheduler :: PushChannel -> OutChan (MessageTag, Message) -> CompMonad ThreadId
     startSendingMessagesToScheduler toScheduler techChanOut = do
         Env{..} <- ask
-        liftIO $ forkIO $ processMQError $ do
+        liftIO $ forkIO $ processMQError $
             foreverSafe name $ do
-                (tag, msg) <- liftIO $ readChan techChanOut
+                (_, msg) <- liftIO $ readChan techChanOut
                 push toScheduler msg
 
-    startKillMessageHandling :: OutChan (MessageTag, Message) -> CompMonad () ThreadId
+    startKillMessageHandling :: OutChan (MessageTag, Message) -> CompMonad ThreadId
     startKillMessageHandling techChanOut = do
         Env{..} <- ask
-        liftIO $ forkIO $ processMQError $ do 
+        liftIO $ forkIO $ processMQError $
            foreverSafe name $ do
                 -- listen technical queue
                 (tag, Message{..}) <- liftIO $ readChan techChanOut
@@ -148,10 +155,10 @@ technicalPart = do
       where
         killSpec = spec (props :: Props KillConfig)
 
-    startMonitoring :: InChan (MessageTag, Message) -> CompMonad () ThreadId
+    startMonitoring :: InChan (MessageTag, Message) -> CompMonad ThreadId
     startMonitoring mainChanIn = do
         Env{..} <- ask
-        liftIO $ forkIO $ processMQError $ do
+        liftIO $ forkIO $ processMQError $
             foreverSafe name $ do
                 liftIO $ threadDelay (millisToMicros frequency)
                 currentTime <- getTimeMillis
@@ -164,35 +171,38 @@ technicalPart = do
         millisToMicros :: Int -> Int
         millisToMicros = (*) 1000
 
-communicationalPart :: (Message -> MQMonad Message) -> MQMonad ()
+communicationalPart :: (Message -> CompMonad Message) -> CompMonad ()
 communicationalPart messageHandler = do
+    env@Env{..} <- ask
     (mainChanIn, mainChanOut) <- liftIO newChan
     (commChanIn, commChanOut) <- liftIO newChan
-    TwoChannels{..} <- load2Channels
+    TwoChannels{..} <- liftMQ load2Channels
     startCollectingMessagesFromScheduler fromScheduler commChanIn
     startSendingMessagesToScheduler toScheduler commChanOut
-    foreverSafe "message-handler" $ do   
-        (tag, msg) <- liftIO $ readChan commChanOut
-        response <- messageHandler msg
-        liftIO $ writeChan commChanIn (messageTag response, response)
+    liftIO $ forkIO $ processMQError $ 
+        foreverSafe name $ do   
+            (tag, msg) <- liftIO $ readChan commChanOut
+            response <- runCompMonad (messageHandler msg) env
+            liftIO $ writeChan commChanIn (messageTag response, response)
+    pure ()
   where
-    startCollectingMessagesFromScheduler :: SubChannel -> InChan (MessageTag, Message) -> MQMonad ()
+    startCollectingMessagesFromScheduler :: SubChannel -> InChan (MessageTag, Message) -> CompMonad ThreadId
     startCollectingMessagesFromScheduler fromScheduler commChanIn = do
-        liftIO $ forkIO $ processMQError $ do
-            foreverSafe "com-orchestrator-collector" $ do
+        Env{..} <- ask
+        liftIO $ forkIO $ processMQError $
+            foreverSafe name $ do
                 msg <- sub fromScheduler
                 liftIO $ writeChan commChanIn msg
-        pure()
 
-    startSendingMessagesToScheduler :: PushChannel -> OutChan (MessageTag, Message) -> MQMonad ()
+    startSendingMessagesToScheduler :: PushChannel -> OutChan (MessageTag, Message) -> CompMonad ThreadId
     startSendingMessagesToScheduler toScheduler commChanOut = do
+        Env{..} <- ask
         liftIO $ forkIO $ processMQError $
-            foreverSafe "com-orchestrator-sender" $ do
-                (tag, msg) <- liftIO $ readChan commChanOut
+            foreverSafe name $ do
+                (_, msg) <- liftIO $ readChan commChanOut
                 push toScheduler msg
-        pure()
 
-runComponent :: Name -> (Message -> MQMonad Message) -> IO ()
+runComponent :: Name -> (Message -> CompMonad Message) -> IO ()
 runComponent name' messageHandler = do
     env@Env{..} <- loadEnv name'
     -- setupLogger env
@@ -200,7 +210,7 @@ runComponent name' messageHandler = do
     infoM name "running technical fork..."
     _ <- forkIO $ processMQError $ runCompMonad technicalPart env
     infoM name "running communication fork..."
-    _ <- forkIO $ processMQError $ communicationalPart messageHandler
+    _ <- forkIO $ processMQError $ runCompMonad (communicationalPart messageHandler) env
     pure ()
 
 processMQError :: MQMonad () -> IO ()
