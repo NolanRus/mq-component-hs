@@ -1,37 +1,22 @@
-{-# LANGUAGE GeneralizedNewtypeDeriving #-}
-{-# LANGUAGE OverloadedStrings          #-}
-{-# LANGUAGE RecordWildCards            #-}
-{-# LANGUAGE ScopedTypeVariables        #-}
+{-# LANGUAGE RecordWildCards     #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 
 module System.MQ.Component.Internal.App
   (
     runApp
   , runAppS
   , runAppWithTech
-  , runComponent
-  , liftMQ
-  , CompMonad
   , runTech
   , processKill
   , processMonitoring
   ) where
 
-import           Control.Concurrent                                (ThreadId,
-                                                                    forkIO,
-                                                                    threadDelay,
-                                                                    killThread)
+import           Control.Concurrent                                (forkIO,
+                                                                    threadDelay)
 import           Control.Concurrent.MVar                           (isEmptyMVar,
-                                                                    putMVar,
-                                                                    takeMVar)
+                                                                    putMVar)
 import           Control.Monad                                     (forever,
                                                                     when)
-import           Control.Monad.Except                              (MonadError)
-import           Control.Monad.IO.Class                            (MonadIO)
-import           Control.Monad.State                               (MonadState)
-import           Control.Monad.Reader                              (ReaderT (..),
-                                                                    MonadReader (..))
-import           Data.Text                                          as T (pack, unpack)
-import           Data.Maybe                                        (fromJust)
 import           Control.Monad.Except                              (catchError)
 import           Control.Monad.IO.Class                            (liftIO)
 import           System.Log.Formatter                              (simpleLogFormatter)
@@ -42,193 +27,17 @@ import           System.Log.Logger                                 (Priority (..
                                                                     infoM,
                                                                     setLevel,
                                                                     updateGlobalLogger)
-import           System.MQ.Component.Internal.Atomic               (createAtomic, 
-                                                                    Atomic (..), 
-                                                                    tryLastMsgId,
-                                                                    tryIsAlive,
-                                                                    tryMessage)
-import           System.MQ.Component.Internal.Config               (loadEnv,
-                                                                    loadTechChannels,
-                                                                    load2Channels)
+import           System.MQ.Component.Internal.Atomic               (createAtomic)
+import           System.MQ.Component.Internal.Config               (loadEnv)
 import           System.MQ.Component.Internal.Env                  (Env (..),
-                                                                    Name,
-                                                                    TwoChannels (..))
+                                                                    Name)
 import           System.MQ.Component.Internal.Technical.Kill       (processKill)
 import           System.MQ.Component.Internal.Technical.Monitoring (processMonitoring)
-import           System.MQ.Error                                   (MQError(..))
-import           System.MQ.Protocol                                (Message (..), 
-                                                                    MessageTag, 
-                                                                    MessageLike (..), 
-                                                                    Condition (..),
-                                                                    MessageType (..),
-                                                                    Props,
-                                                                    matches,
-                                                                    messageTag,
-                                                                    messageType,
-                                                                    messageSpec,
-                                                                    notExpires,
-                                                                    createMessage,
-                                                                    emptyId,
-                                                                    getTimeMillis,
-                                                                    spec)
-import           System.MQ.Protocol.Technical                      (MonitoringData (..),
-                                                                    KillConfig (..))
 import           System.MQ.Monad                                   (MQMonad,
                                                                     MQMonadS,
                                                                     errorHandler,
                                                                     runMQMonad,
-                                                                    runMQMonadS,
-                                                                    foreverSafe)
-import           System.MQ.Transport                               (PushChannel,
-                                                                    SubChannel,
-                                                                    sub,
-                                                                    push)
-import           Control.Concurrent.Chan.Unagi                     
-import      System.Log.Logger
-
-newtype CompMonadS s a = CompMonadS (ReaderT Env (MQMonadS s) a)
-  deriving ( Monad
-           , Functor
-           , Applicative
-           , MonadReader Env
-           , MonadIO
-           , MonadError MQError
-           , MonadState s)
-
-type CompMonad = CompMonadS ()
-
-runCompMonadS :: CompMonadS s a -> Env -> MQMonadS s a
-runCompMonadS (CompMonadS r) = runReaderT r 
-
-runCompMonad :: CompMonad a -> Env -> MQMonadS () a
-runCompMonad = runCompMonadS 
-
-liftMQ :: MQMonadS s a -> CompMonadS s a 
-liftMQ m = CompMonadS $ ReaderT (const m)
-
-technicalPart :: CompMonad ()
-technicalPart = do
-    liftIO $ debugM "Internal.App" "technicalPart"
-    (mainChanIn, mainChanOut) <- liftIO newChan
-    (techChanIn, techChanOut) <- liftIO newChan
-    TwoChannels{..} <- liftMQ loadTechChannels
-    _ <- startCollectingMessagesFromScheduler fromScheduler techChanIn
-    _ <- startSendingMessagesToScheduler toScheduler mainChanOut
-    _ <- startKillMessageHandling techChanOut
-    _ <- startMonitoring mainChanIn
-    pure ()
-  where
-    startCollectingMessagesFromScheduler :: SubChannel -> InChan (MessageTag, Message) -> CompMonad ThreadId
-    startCollectingMessagesFromScheduler fromScheduler techChanIn = do
-        Env{..} <- ask
-        liftIO $ forkIO $ processMQError' $
-            foreverSafe name $ do
-                msg <- sub fromScheduler
-                liftIO $ writeChan techChanIn msg
-                liftIO $ debugM "Internal.App" "startCollectingMessagesFromScheduler"
-
-    startSendingMessagesToScheduler :: PushChannel -> OutChan (MessageTag, Message) -> CompMonad ThreadId
-    startSendingMessagesToScheduler toScheduler techChanOut = do
-        Env{..} <- ask
-        liftIO $ forkIO $ processMQError' $
-            foreverSafe name $ do
-                (_, msg) <- liftIO $ readChan techChanOut
-                push toScheduler msg
-                liftIO $ debugM "Internal.App" "startSendingMessagesToScheduler"
-
-    startKillMessageHandling :: OutChan (MessageTag, Message) -> CompMonad ThreadId
-    startKillMessageHandling techChanOut = do
-        Env{..} <- ask
-        liftIO $ forkIO $ processMQError' $
-           foreverSafe name $ do
-                -- listen technical queue
-                (tag, Message{..}) <- liftIO $ readChan techChanOut
-                -- if reveive 'KillConfig' message then...
-                when (tag `matches` (messageType :== Config :&& messageSpec :== killSpec)) $ do
-                  -- unpack message
-                  KillConfig{..} <- unpackM msgData
-                  -- get current task ID
-                  curMsgId <- tryLastMsgId atomic
-                  -- if current task ID is the same as in received message then...
-                  when (curMsgId == Just killTaskId) $ do
-                      -- get atomic 'MVar'
-                      Atomic{..} <- liftIO $ takeMVar atomic
-                      -- kill communication thread (it will be restarted later by main thread)
-                      liftIO $ killThread _threadId
-                      liftIO $ infoM name ("TECHNICAL: task " ++ T.unpack (fromJust curMsgId) ++ " killed")
-                liftIO $ debugM "Internal.App" "startKillMessageHandling "
-      where
-        killSpec = spec (props :: Props KillConfig)
-
-    startMonitoring :: InChan (MessageTag, Message) -> CompMonad ThreadId
-    startMonitoring mainChanIn = do
-        Env{..} <- ask
-        liftIO $ forkIO $ processMQError' $
-            foreverSafe name $ do
-                liftIO $ threadDelay (millisToMicros frequency)
-                currentTime <- getTimeMillis
-                curStatus   <- tryIsAlive atomic >>= maybe (pure False) pure
-                curMessage  <- tryMessage atomic >>= maybe (pure "Communication layer's thread is down") pure
-                let monResult = MonitoringData currentTime name curStatus curMessage
-                msg <- createMessage emptyId (T.pack name) notExpires monResult
-                liftIO $ writeChan mainChanIn (messageTag msg, msg)
-                liftIO $ debugM "Internal.App" "startMonitoring "
-      where
-        millisToMicros :: Int -> Int
-        millisToMicros = (*) 1000
-
-communicationalPart :: (Message -> CompMonad Message) -> CompMonad ()
-communicationalPart messageHandler = do
-    liftIO $ debugM "Internal.App" "communicationalPart"
-    env@Env{..} <- ask
-    -- create channel to orchestrator
-    (mainChanIn, mainChanOut) <- liftIO newChan
-    -- create channel to communication handler
-    (commChanIn, commChanOut) <- liftIO newChan
-    TwoChannels{..} <- liftMQ load2Channels
-    _ <- startCollectingMessagesFromScheduler fromScheduler commChanIn
-    _ <- startSendingMessagesToScheduler toScheduler mainChanOut
-    _ <- liftIO $ forkIO $ processMQError' $ 
-        foreverSafe name $ do   
-            (_, msg) <- liftIO $ readChan commChanOut
-            response <- runCompMonad (messageHandler msg) env
-            liftIO $ writeChan mainChanIn (messageTag response, response)
-            liftIO $ debugM "Internal.App" "communicationalPart"
-    pure ()
-  where
-    startCollectingMessagesFromScheduler :: SubChannel -> InChan (MessageTag, Message) -> CompMonad ThreadId
-    startCollectingMessagesFromScheduler fromScheduler commChanIn = do
-        Env{..} <- ask
-        liftIO $ forkIO $ processMQError' $
-            foreverSafe name $ do
-                msg <- sub fromScheduler
-                liftIO $ writeChan commChanIn msg
-                liftIO $ debugM "Internal.App" "startCollectingMessagesFromScheduler "
-
-    startSendingMessagesToScheduler :: PushChannel -> OutChan (MessageTag, Message) -> CompMonad ThreadId
-    startSendingMessagesToScheduler toScheduler mainChanOut = do
-        Env{..} <- ask
-        liftIO $ forkIO $ processMQError' $
-            foreverSafe name $ do
-                (_, msg) <- liftIO $ readChan mainChanOut
-                push toScheduler msg
-                liftIO $ debugM "Internal.App" "startSendingMessagesToScheduler"
-
-runComponent :: Name -> (Message -> CompMonad Message) -> IO ()
-runComponent name' messageHandler = do
-    debugM "Internal.App" "runComponent"
-    env@Env{..} <- loadEnv name'
-    -- setupLogger env
-    infoM name "running component..."
-    infoM name "running technical fork..."
-    _ <- forkIO $ processMQError' $ runCompMonad technicalPart env
-    infoM name "running communication fork..."
-    _ <- forkIO $ processMQError' $ runCompMonad (communicationalPart messageHandler) env
-    forever $ threadDelay 1000000
-    pure ()
-
-processMQError' :: MQMonad () -> IO ()
-processMQError' = fmap fst . flip runMQMonadS () . flip catchError (errorHandler "empty")
+                                                                    runMQMonadS)
 
 runApp :: Name -> (Env -> MQMonad ()) -> IO ()
 runApp name' = runAppS name' ()
@@ -254,7 +63,7 @@ runAppWithTechS name' state runComm runCustomTech = do
         atomicIsEmpty <- isEmptyMVar atomic
 
         when atomicIsEmpty $ do
-            infoM name "there is no communication thread, creating new one..."
+            infoM name "there is not communication thread, creating new one..."
             commThreadId <- forkIO $ processMQError state $ runComm env
 
             let newAtomic = createAtomic commThreadId

@@ -17,10 +17,10 @@ import           System.MQ.Transport                 (PullChannel, PushChannel,
 
 type Name = String
 
-data Env = Env { name      :: Name          -- | Name of the component 
-               , creator   :: Creator       -- | 
+data Env = Env { name      :: Name
+               , creator   :: Creator
                , logfile   :: FilePath
-               , frequency :: Int           -- | How often we need to send monitoring messages
+               , frequency :: Int
                , atomic    :: MVar Atomic
                }
 
