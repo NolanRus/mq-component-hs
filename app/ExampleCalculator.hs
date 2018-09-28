@@ -5,7 +5,7 @@ module Main where
 import           Control.Monad.IO.Class                (liftIO)
 import           System.Log.Logger                     (infoM)
 
-import           Control.Monad                         (guard)
+import           Control.Monad                         (unless)
 import           Control.Monad.Reader                  (ask)
 import           ExampleCalculatorTypes                (CalculatorConfig (..),
                                                         CalculatorResult (..))
@@ -32,14 +32,14 @@ main = do
 -- returns result of that multiplication in 'CalculatorResult'.
 --
 calculatorWorkerAction :: Message -> CompMonad Message 
-calculatorWorkerAction msg@(Message{..}) = do
+calculatorWorkerAction msg@Message{..} = do
     Env{..} <- ask
     let tag = messageTag msg
-    -- when (checkTag tag)
+    unless (checkTag tag) $ error "I don't work with such tags"
     -- Set 'lastMsgId' to id of message that worker will process
     updateLastMsgId msgId atomic
     -- Process data from message using 'action'
-    let Just (CalculatorConfig{..}) = unpack msgData
+    let Just CalculatorConfig{..} = unpack msgData
     result <- case action of
                     -- this error will be caught by worker template
                     "-" -> error "we can't subtract"

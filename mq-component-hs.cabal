@@ -65,9 +65,11 @@ executable example-radio-speaker
   other-modules:       ExampleRadioTypes
   build-depends:       base
                      , aeson
+                     , mtl
                      , mq
                      , mq-component-hs
                      , mq
+                     , hslogger
   default-language:    Haskell2010
   ghc-options:         -threaded -rtsopts -with-rtsopts=-N -Wall -O2
 
@@ -79,6 +81,8 @@ executable example-radio-listener
                      , aeson
                      , mq
                      , mq-component-hs
+                     , hslogger
+                     , text
   default-language:    Haskell2010
   ghc-options:         -threaded -rtsopts -with-rtsopts=-N -Wall -O2
 
