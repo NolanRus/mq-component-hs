@@ -55,6 +55,7 @@ library
                      , semigroups
                      , text
                      , unix-time
+                     , unagi-chan
   ghc-options:         -Wall -O2
   default-language:    Haskell2010
 
