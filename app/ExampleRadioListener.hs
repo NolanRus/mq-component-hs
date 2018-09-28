@@ -3,28 +3,28 @@
 
 module Main where
 
-import           Control.Monad          (when)
-import           Control.Monad.IO.Class (liftIO)
-import           ExampleRadioTypes      (RadioData (..))
-import           System.MQ.Component    (Env (..), TwoChannels (..),
-                                         load2Channels, runApp)
+import           Control.Monad                          (when)
+import           Control.Monad.IO.Class                 (liftIO)
+import           ExampleRadioTypes                      (RadioData (..))
+import           System.MQ.Component                    (Env (..), runComponent)
 import           System.MQ.Monad
 import           System.MQ.Protocol
-import           System.MQ.Transport
+import           Control.Concurrent.Chan.Unagi          (InChan, OutChan, readChan)
+
+import      System.Log.Logger
 
 main :: IO ()
-main = runApp "example_radio-listener-hs" app
+main = runComponent "example_radio-listener-hs" () app
 
-app :: Env -> MQMonadS () ()
-app Env{..} = do
-  TwoChannels from _ <- load2Channels
-  -- Following line is equal to `subscribeTo from "data:example_radio"`.
-  -- It is equal to subscribe to all messages that starts with "data:example_radio".
-  subscribeToTypeSpec from (mtype messageProps) (spec messageProps)
-
+app :: Env -> OutChan (MessageTag, Message) -> InChan Message -> MQMonad ()
+app Env{..} outChan _ = do
+  -- We can't subscribe to specific topic so far, so we're just receiveing all messages.
+  -- subscribeToTypeSpec from (mtype messageProps) (spec messageProps)
+  liftIO $ infoM name "app is started"
   foreverSafe name $ do
       -- receive message
-      (tag, Message{..}) <- sub from
+      (tag, Message{..}) <- liftIO $ readChan outChan
+      liftIO $ infoM name "message was read"
       -- be sure that tag is correct
       when (checkTag tag) $ do
           -- unpack data from the message
