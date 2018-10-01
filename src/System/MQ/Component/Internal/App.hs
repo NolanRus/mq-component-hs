@@ -1,5 +1,6 @@
 {-# LANGUAGE RecordWildCards     #-}
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE OverloadedStrings   #-}
 
 module System.MQ.Component.Internal.App
   (
@@ -12,8 +13,6 @@ module System.MQ.Component.Internal.App
   , processKill
   , processMonitoring
   ) where
-
-import System.Log.Logger
 
 import qualified Data.Text                                    as T (unpack)
 import           Data.Maybe                                        (fromJust)
@@ -34,11 +33,16 @@ import           System.Log.Handler.Simple                         (fileHandler)
 import           System.Log.Logger                                 (Priority (..),
                                                                     addHandler,
                                                                     infoM,
+                                                                    debugM,
                                                                     setLevel,
                                                                     updateGlobalLogger)
 import           System.MQ.Component.Internal.Atomic               (createAtomic, Atomic (..), tryLastMsgId,
                                                                     tryIsAlive, tryMessage)
-import           System.MQ.Component.Internal.Config               (loadEnv, load2Channels, loadTechChannels)
+import           System.MQ.Component.Internal.Config               (loadEnv, load2Channels, loadTechChannels,
+                                                                    openCommunicationalConnectionToScheduler,
+                                                                    openCommunicationalConnectionFromScheduler,
+                                                                    openTechnicalConnectionToScheduler,
+                                                                    openTechnicalConnectionFromScheduler)
 import           System.MQ.Component.Internal.Env                  (Env (..),
                                                                     Name,
                                                                     TwoChannels (..))
@@ -56,7 +60,7 @@ import           System.MQ.Protocol                                (Message (..)
                                                                     createMessage, emptyId,
                                                                     getTimeMillis, notExpires)
 import           System.MQ.Protocol.Technical                      (KillConfig (..), MonitoringData (..))
-import           System.MQ.Transport                               (SubChannel, PushChannel, sub, push)
+import           System.MQ.Transport                               (SubChannel, PushChannel, sub, push, subscribeToTypeSpec)
 
 
 runApp :: Name -> (Env -> MQMonad ()) -> IO ()
@@ -110,10 +114,6 @@ runTech env@Env{..} = do
     _ <- liftIO . forkIO . runMQMonad $ processKill env
     processMonitoring env
 
-------------------------------------------------------------------------------
-------------------------------------------------------------------------------
-------------------------------------------------------------------------------
-
 type ConnectionHandler s = Env -> OutChan (MessageTag, Message) -> InChan Message -> MQMonadS s ()
 
 handleMQError :: Env -> s -> MQMonadS s () -> IO ()
@@ -122,36 +122,55 @@ handleMQError Env{..} state' computation = do
     ((), _) <- runMQMonadS wrappedComputation state'
     pure ()
 
-handleConnection :: Env -> SubChannel -> PushChannel -> ConnectionHandler s -> MQMonadS s ()
-handleConnection env fromScheduler toScheduler handler = do
+data OpenConnection = OpenConnection { connectFromScheduler :: Name -> IO SubChannel
+                                     , connectToScheduler   :: Name -> IO PushChannel
+                                     }
+
+handleConnection :: Env -> OpenConnection -> ConnectionHandler s -> MQMonadS s ()
+handleConnection env@Env{..} openConnection handler = do
     (mainIn, mainOut) <- liftIO newChan
     (jobIn, jobOut) <- liftIO newChan
-    _ <- liftIO $ forkIO $ handleMQError env () $ collectMessagesFromScheduler env fromScheduler jobIn
-    _ <- liftIO $ forkIO $ handleMQError env () $ transferMessagesToScheduler env mainOut toScheduler
+    _ <- liftIO $ forkIO $ handleMQError env () $ collectMessagesFromScheduler jobIn
+    _ <- liftIO $ forkIO $ handleMQError env () $ transferMessagesToScheduler mainOut 
+    liftIO $ debugM name "Start connection handler..."
     handler env jobOut mainIn
   where
-    collectMessagesFromScheduler :: Env -> SubChannel -> InChan (MessageTag, Message) -> MQMonadS () ()
-    collectMessagesFromScheduler Env{..} fromScheduler' jobIn = do
-        liftIO $ debugM name "Start collecting messages from scheduler..."
+    collectMessagesFromScheduler :: InChan (MessageTag, Message) -> MQMonadS () ()
+    collectMessagesFromScheduler jobIn = do
+        fromScheduler' <- liftIO $ connectFromScheduler openConnection name
+        liftIO $ debugM name "Start collecting mesages..."
         foreverSafe name $ do
             tagAndMsg <- sub fromScheduler'
             liftIO $ writeChan jobIn tagAndMsg
 
-    transferMessagesToScheduler :: Env -> OutChan Message -> PushChannel -> MQMonadS () ()
-    transferMessagesToScheduler Env{..} mainOut toScheduler' = 
+    transferMessagesToScheduler :: OutChan Message -> MQMonadS () ()
+    transferMessagesToScheduler mainOut = do
+        toScheduler' <- liftIO $ connectToScheduler openConnection name
+        liftIO $ debugM name "Start transferring mesages..."
         foreverSafe name $ do
             msg <- liftIO $ readChan mainOut
             push toScheduler' msg
 
 runTechPart :: Env -> ConnectionHandler () -> MQMonad ()
-runTechPart env runCustomTech = do
-    TwoChannels{..} <- loadTechChannels
-    handleConnection env fromScheduler toScheduler runCustomTech
+runTechPart env@Env{..} runCustomTech = do
+    liftIO $ debugM name "Running technical part..."
+    handleConnection env openConnection runCustomTech
+  where
+    connectFromScheduler = openTechnicalConnectionFromScheduler
+    connectToScheduler   = openTechnicalConnectionToScheduler
+    openConnection       = OpenConnection {..}
 
 runCommPart :: Env -> ConnectionHandler s -> MQMonadS s ()
-runCommPart env runComm = do
-    TwoChannels{..} <- load2Channels
-    handleConnection env fromScheduler toScheduler runComm
+runCommPart env@Env{..} runComm = do
+    liftIO $ debugM name "Running communicational part..."
+    handleConnection env openConnection runComm
+  where
+    connectFromScheduler name = do
+        fromScheduler <- openCommunicationalConnectionFromScheduler name
+        subscribeToTypeSpec fromScheduler Data "example_radio" 
+        pure fromScheduler
+    connectToScheduler name   = openCommunicationalConnectionToScheduler name
+    openConnection            = OpenConnection {..}
 
 runComponent :: Name -> s -> ConnectionHandler s -> IO ()
 runComponent name' state' runComm = runComponentWithCustomTech name' state' runComm runDefaultTechHandler
@@ -202,15 +221,15 @@ runComponentWithCustomTech name' state' runComm runCustomTech = do
     setupLogger env
     infoM name "running component..."
     infoM name "running technical fork..."
-    _ <- forkIO $ processMQError () $ runTechPart env runCustomTech
-    processMQError state' $ runCommPart env runComm
+    _ <- forkIO $ processMQError () $ runTechPart env{ name = name ++ "-tech" } runCustomTech
+    processMQError state' $ runCommPart env{ name = name ++ "-comm" } runComm
   where
     processMQError :: s -> MQMonadS s () -> IO ()
     processMQError s = fmap fst . flip runMQMonadS s . flip catchError (errorHandler name')
 
     setupLogger :: Env -> IO ()
     setupLogger Env{..} = do
-        h <- fileHandler logfile INFO >>= \lh -> return $
+        h <- fileHandler logfile DEBUG >>= \lh -> return $
                  setFormatter lh (simpleLogFormatter "[$time : $loggername : $prio] $msg")
         updateGlobalLogger name (addHandler h)
-        updateGlobalLogger name (setLevel DEBUG)--INFO)
+        updateGlobalLogger name (setLevel INFO)

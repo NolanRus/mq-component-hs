@@ -11,6 +11,10 @@ module System.MQ.Component.Internal.Config
   , load2ChannelsWithContext
   , loadTechChannels
   , loadTechChannelsWithContext
+  , openCommunicationalConnectionToScheduler
+  , openCommunicationalConnectionFromScheduler
+  , openTechnicalConnectionToScheduler
+  , openTechnicalConnectionFromScheduler
   ) where
 
 import           Control.Concurrent.MVar          (newEmptyMVar)
@@ -25,7 +29,34 @@ import           System.MQ.Monad                  (MQMonadS)
 import           System.MQ.Transport              (ConnectTo (..), Context,
                                                    Host, HostPort (..), Port,
                                                    contextM)
+import           System.MQ.Transport              (PushChannel, SubChannel)
 
+
+-- | ToDo: upgrade MQ monad or create new monad for components to introduce
+-- Reader capabilites. Passing Env around is annoying.
+openCommunicationalConnectionToScheduler :: Name -> IO PushChannel
+openCommunicationalConnectionToScheduler name' = do
+    context' <- contextM
+    SchedulerCfg{..} <- schedulerInFromConfig
+    connectTo (HostPort host comport) context'
+
+openCommunicationalConnectionFromScheduler :: Name -> IO SubChannel
+openCommunicationalConnectionFromScheduler name' = do
+    context' <- contextM
+    SchedulerCfg{..} <- schedulerOutFromConfig
+    connectTo (HostPort host comport) context'
+
+openTechnicalConnectionToScheduler :: Name -> IO PushChannel
+openTechnicalConnectionToScheduler name' = do
+    context' <- contextM
+    SchedulerCfg{..} <- schedulerInFromConfig
+    connectTo (HostPort host comport) context'
+
+openTechnicalConnectionFromScheduler :: Name -> IO SubChannel
+openTechnicalConnectionFromScheduler name' = do
+    context' <- contextM
+    SchedulerCfg{..} <- schedulerOutFromConfig
+    connectTo (HostPort host comport) context'
 
 loadEnv :: Name -> IO Env
 loadEnv name' = do
@@ -34,7 +65,6 @@ loadEnv name' = do
     let logfile'   = config |-- ["params", T.pack name', "logfile"]
     let frequency' = config |-- ["params", T.pack name', "frequency"]
     Env name' creator' logfile' frequency' <$> liftIO newEmptyMVar
-
 
 load3Channels :: forall s. Name -> MQMonadS s ThreeChannels
 load3Channels name' = contextM >>= flip load3ChannelsWithContext name'
@@ -109,8 +139,4 @@ schedulerFromJSON route = do
     pure $ SchedulerCfg (getField "host")
                         (getField "comport")
                         (getField "techport")
-
-
-
-
 
