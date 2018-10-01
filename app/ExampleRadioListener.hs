@@ -10,8 +10,7 @@ import           System.MQ.Component                    (Env (..), runComponent)
 import           System.MQ.Monad
 import           System.MQ.Protocol
 import           Control.Concurrent.Chan.Unagi          (InChan, OutChan, readChan)
-
-import      System.Log.Logger
+import           System.Log.Logger                      (infoM)
 
 main :: IO ()
 main = runComponent "example_radio-listener-hs" () app
@@ -20,11 +19,11 @@ app :: Env -> OutChan (MessageTag, Message) -> InChan Message -> MQMonad ()
 app Env{..} outChan _ = do
   -- We can't subscribe to specific topic so far, so we're just receiveing all messages.
   -- subscribeToTypeSpec from (mtype messageProps) (spec messageProps)
-  liftIO $ infoM name "app is started"
+  liftIO $ infoM name "App is started"
   foreverSafe name $ do
       -- receive message
       (tag, Message{..}) <- liftIO $ readChan outChan
-      liftIO $ infoM name "message was read"
+      liftIO $ infoM name "Message was read"
       -- be sure that tag is correct
       when (checkTag tag) $ do
           -- unpack data from the message

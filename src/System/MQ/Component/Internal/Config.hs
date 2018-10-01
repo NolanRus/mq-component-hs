@@ -31,32 +31,23 @@ import           System.MQ.Transport              (ConnectTo (..), Context,
                                                    contextM)
 import           System.MQ.Transport              (PushChannel, SubChannel)
 
+openCommunicationalConnectionToScheduler :: IO PushChannel
+openCommunicationalConnectionToScheduler = openConnection comport
 
--- | ToDo: upgrade MQ monad or create new monad for components to introduce
--- Reader capabilites. Passing Env around is annoying.
-openCommunicationalConnectionToScheduler :: Name -> IO PushChannel
-openCommunicationalConnectionToScheduler name' = do
-    context' <- contextM
-    SchedulerCfg{..} <- schedulerInFromConfig
-    connectTo (HostPort host comport) context'
+openCommunicationalConnectionFromScheduler :: IO SubChannel
+openCommunicationalConnectionFromScheduler = openConnection comport
 
-openCommunicationalConnectionFromScheduler :: Name -> IO SubChannel
-openCommunicationalConnectionFromScheduler name' = do
-    context' <- contextM
-    SchedulerCfg{..} <- schedulerOutFromConfig
-    connectTo (HostPort host comport) context'
+openTechnicalConnectionToScheduler :: IO PushChannel
+openTechnicalConnectionToScheduler = openConnection techport
 
-openTechnicalConnectionToScheduler :: Name -> IO PushChannel
-openTechnicalConnectionToScheduler name' = do
-    context' <- contextM
-    SchedulerCfg{..} <- schedulerInFromConfig
-    connectTo (HostPort host comport) context'
+openTechnicalConnectionFromScheduler :: IO SubChannel
+openTechnicalConnectionFromScheduler = openConnection techport 
 
-openTechnicalConnectionFromScheduler :: Name -> IO SubChannel
-openTechnicalConnectionFromScheduler name' = do
+openConnection :: ConnectTo a => (SchedulerCfg -> Port) -> IO a
+openConnection portFromConfig = do
     context' <- contextM
-    SchedulerCfg{..} <- schedulerOutFromConfig
-    connectTo (HostPort host comport) context'
+    config@SchedulerCfg{..} <- schedulerOutFromConfig
+    connectTo (HostPort host (portFromConfig config)) context'
 
 loadEnv :: Name -> IO Env
 loadEnv name' = do

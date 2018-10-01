@@ -38,14 +38,13 @@ import           System.Log.Logger                                 (Priority (..
                                                                     updateGlobalLogger)
 import           System.MQ.Component.Internal.Atomic               (createAtomic, Atomic (..), tryLastMsgId,
                                                                     tryIsAlive, tryMessage)
-import           System.MQ.Component.Internal.Config               (loadEnv, load2Channels, loadTechChannels,
+import           System.MQ.Component.Internal.Config               (loadEnv, 
                                                                     openCommunicationalConnectionToScheduler,
                                                                     openCommunicationalConnectionFromScheduler,
                                                                     openTechnicalConnectionToScheduler,
                                                                     openTechnicalConnectionFromScheduler)
 import           System.MQ.Component.Internal.Env                  (Env (..),
-                                                                    Name,
-                                                                    TwoChannels (..))
+                                                                    Name)
 import           System.MQ.Component.Internal.Technical.Kill       (processKill)
 import           System.MQ.Component.Internal.Technical.Monitoring (processMonitoring)
 import           System.MQ.Monad                                   (MQMonad,
@@ -122,8 +121,8 @@ handleMQError Env{..} state' computation = do
     ((), _) <- runMQMonadS wrappedComputation state'
     pure ()
 
-data OpenConnection = OpenConnection { connectFromScheduler :: Name -> IO SubChannel
-                                     , connectToScheduler   :: Name -> IO PushChannel
+data OpenConnection = OpenConnection { openConnectionFromScheduler :: IO SubChannel
+                                     , openConnectionToScheduler   :: IO PushChannel
                                      }
 
 handleConnection :: Env -> OpenConnection -> ConnectionHandler s -> MQMonadS s ()
@@ -137,7 +136,7 @@ handleConnection env@Env{..} openConnection handler = do
   where
     collectMessagesFromScheduler :: InChan (MessageTag, Message) -> MQMonadS () ()
     collectMessagesFromScheduler jobIn = do
-        fromScheduler' <- liftIO $ connectFromScheduler openConnection name
+        fromScheduler' <- liftIO $ openConnectionFromScheduler openConnection
         liftIO $ debugM name "Start collecting mesages..."
         foreverSafe name $ do
             tagAndMsg <- sub fromScheduler'
@@ -145,7 +144,7 @@ handleConnection env@Env{..} openConnection handler = do
 
     transferMessagesToScheduler :: OutChan Message -> MQMonadS () ()
     transferMessagesToScheduler mainOut = do
-        toScheduler' <- liftIO $ connectToScheduler openConnection name
+        toScheduler' <- liftIO $ openConnectionToScheduler openConnection
         liftIO $ debugM name "Start transferring mesages..."
         foreverSafe name $ do
             msg <- liftIO $ readChan mainOut
@@ -156,21 +155,24 @@ runTechPart env@Env{..} runCustomTech = do
     liftIO $ debugM name "Running technical part..."
     handleConnection env openConnection runCustomTech
   where
-    connectFromScheduler = openTechnicalConnectionFromScheduler
-    connectToScheduler   = openTechnicalConnectionToScheduler
-    openConnection       = OpenConnection {..}
+    openConnectionFromScheduler = openTechnicalConnectionFromScheduler
+    openConnectionToScheduler   = openTechnicalConnectionToScheduler
+    openConnection              = OpenConnection {..}
 
 runCommPart :: Env -> ConnectionHandler s -> MQMonadS s ()
 runCommPart env@Env{..} runComm = do
     liftIO $ debugM name "Running communicational part..."
     handleConnection env openConnection runComm
   where
-    connectFromScheduler name = do
-        fromScheduler <- openCommunicationalConnectionFromScheduler name
+    -- | This should be done in a different way of course. Purhaps it's better
+    -- to create class for message handler. It should tell what topics we need
+    -- to subscribe to.
+    openConnectionFromScheduler = do
+        fromScheduler <- openCommunicationalConnectionFromScheduler 
         subscribeToTypeSpec fromScheduler Data "example_radio" 
         pure fromScheduler
-    connectToScheduler name   = openCommunicationalConnectionToScheduler name
-    openConnection            = OpenConnection {..}
+    openConnectionToScheduler   = openCommunicationalConnectionToScheduler
+    openConnection              = OpenConnection {..}
 
 runComponent :: Name -> s -> ConnectionHandler s -> IO ()
 runComponent name' state' runComm = runComponentWithCustomTech name' state' runComm runDefaultTechHandler
@@ -229,7 +231,7 @@ runComponentWithCustomTech name' state' runComm runCustomTech = do
 
     setupLogger :: Env -> IO ()
     setupLogger Env{..} = do
-        h <- fileHandler logfile DEBUG >>= \lh -> return $
+        h <- fileHandler logfile INFO >>= \lh -> return $
                  setFormatter lh (simpleLogFormatter "[$time : $loggername : $prio] $msg")
         updateGlobalLogger name (addHandler h)
         updateGlobalLogger name (setLevel INFO)
