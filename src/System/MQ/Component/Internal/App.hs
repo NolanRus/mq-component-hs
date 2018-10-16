@@ -14,6 +14,7 @@ module System.MQ.Component.Internal.App
   , processMonitoring
   ) where
 
+import           Data.Function                                     (fix)
 import qualified Data.Text                                    as T (unpack)
 import           Data.Maybe                                        (fromJust)
 import           Control.Concurrent.Chan.Unagi                     (newChan, InChan, OutChan, writeChan, readChan)
@@ -24,7 +25,8 @@ import           Control.Concurrent.MVar                           (isEmptyMVar,
                                                                     putMVar,
                                                                     takeMVar)
 import           Control.Monad                                     (forever,
-                                                                    when)
+                                                                    when,
+                                                                    forM_)
 import           Control.Monad.Except                              (catchError)
 import           Control.Monad.IO.Class                            (liftIO)
 import           System.Log.Formatter                              (simpleLogFormatter)
@@ -121,59 +123,6 @@ handleMQError Env{..} state' computation = do
     ((), _) <- runMQMonadS wrappedComputation state'
     pure ()
 
-data OpenConnection = OpenConnection { openConnectionFromScheduler :: IO SubChannel
-                                     , openConnectionToScheduler   :: IO PushChannel
-                                     }
-
-handleConnection :: Env -> OpenConnection -> ConnectionHandler s -> MQMonadS s ()
-handleConnection env@Env{..} openConnection handler = do
-    (mainIn, mainOut) <- liftIO newChan
-    (jobIn, jobOut) <- liftIO newChan
-    _ <- liftIO $ forkIO $ handleMQError env () $ collectMessagesFromScheduler jobIn
-    _ <- liftIO $ forkIO $ handleMQError env () $ transferMessagesToScheduler mainOut 
-    liftIO $ debugM name "Start connection handler..."
-    handler env jobOut mainIn
-  where
-    collectMessagesFromScheduler :: InChan (MessageTag, Message) -> MQMonadS () ()
-    collectMessagesFromScheduler jobIn = do
-        fromScheduler' <- liftIO $ openConnectionFromScheduler openConnection
-        liftIO $ debugM name "Start collecting mesages..."
-        foreverSafe name $ do
-            tagAndMsg <- sub fromScheduler'
-            liftIO $ writeChan jobIn tagAndMsg
-
-    transferMessagesToScheduler :: OutChan Message -> MQMonadS () ()
-    transferMessagesToScheduler mainOut = do
-        toScheduler' <- liftIO $ openConnectionToScheduler openConnection
-        liftIO $ debugM name "Start transferring mesages..."
-        foreverSafe name $ do
-            msg <- liftIO $ readChan mainOut
-            push toScheduler' msg
-
-runTechPart :: Env -> ConnectionHandler () -> MQMonad ()
-runTechPart env@Env{..} runCustomTech = do
-    liftIO $ debugM name "Running technical part..."
-    handleConnection env openConnection runCustomTech
-  where
-    openConnectionFromScheduler = openTechnicalConnectionFromScheduler
-    openConnectionToScheduler   = openTechnicalConnectionToScheduler
-    openConnection              = OpenConnection {..}
-
-runCommPart :: Env -> ConnectionHandler s -> MQMonadS s ()
-runCommPart env@Env{..} runComm = do
-    liftIO $ debugM name "Running communicational part..."
-    handleConnection env openConnection runComm
-  where
-    -- | This should be done in a different way of course. Purhaps it's better
-    -- to create class for message handler. It should tell what topics we need
-    -- to subscribe to.
-    openConnectionFromScheduler = do
-        fromScheduler <- openCommunicationalConnectionFromScheduler 
-        subscribeToTypeSpec fromScheduler Data "example_radio" 
-        pure fromScheduler
-    openConnectionToScheduler   = openCommunicationalConnectionToScheduler
-    openConnection              = OpenConnection {..}
-
 runComponent :: Name -> s -> ConnectionHandler s -> IO ()
 runComponent name' state' runComm = runComponentWithCustomTech name' state' runComm runDefaultTechHandler
   where
@@ -221,10 +170,49 @@ runComponentWithCustomTech :: Name -> s -> ConnectionHandler s -> ConnectionHand
 runComponentWithCustomTech name' state' runComm runCustomTech = do
     env@Env{..} <- loadEnv name'
     setupLogger env
-    infoM name "running component..."
-    infoM name "running technical fork..."
-    _ <- forkIO $ processMQError () $ runTechPart env{ name = name ++ "-tech" } runCustomTech
-    processMQError state' $ runCommPart env{ name = name ++ "-comm" } runComm
+    (incomingIn, incomingOut) <- liftIO newChan
+    (outgoingCommIn, outgoingCommOut) <- liftIO newChan
+    (outgoingTechIn, outgoingTechOut) <- liftIO newChan
+    -- | Collectors
+    -- | This should be done in a different way of course. Purhaps it's better
+    -- to create class for message handler. It should tell what topics we need
+    -- to subscribe to.
+    let openConnectionFromScheduler = do
+            fromScheduler <- openCommunicationalConnectionFromScheduler 
+            subscribeToTypeSpec fromScheduler Data "example_radio" 
+            pure fromScheduler
+    let openConnections = [openConnectionFromScheduler, openTechnicalConnectionFromScheduler]
+    forM_ openConnections $ \openConnection ->
+        liftIO $ forkIO $ handleMQError env () $ do
+            fromScheduler <- liftIO openConnection
+            fix $ \action -> do
+                message <- sub fromScheduler
+                liftIO $ writeChan incomingIn message
+                action
+    let outgoing = [(openCommunicationalConnectionToScheduler, outgoingCommOut), 
+                    (openTechnicalConnectionToScheduler, outgoingTechOut)] 
+    forM_ outgoing $ \(openConnection, channel) -> do
+        liftIO $ forkIO $ handleMQError env () $ do
+            toScheduler <- liftIO openConnection
+            fix $ \action -> do
+                message <- liftIO $ readChan channel
+                push toScheduler message
+                action
+    -- | Handlers
+    (commIn, commOut) <- liftIO newChan
+    liftIO $ forkIO $ handleMQError env state' $ do
+        runComm env commOut outgoingCommIn
+    (techIn, techOut) <- liftIO newChan
+    liftIO $ forkIO $ handleMQError env () $ do
+        runCustomTech env techOut outgoingTechIn
+    -- | Dispatcher
+    fix $ \action -> do
+        message@(tag, _) <- liftIO $ readChan incomingOut
+        let checkTag = (`matches` (messageSpec :== spec (props :: Props KillConfig) 
+                               :&& messageType :== mtype (props :: Props KillConfig)))
+        let channel = if checkTag tag then techIn else commIn
+        liftIO $ writeChan channel message
+        action
   where
     processMQError :: s -> MQMonadS s () -> IO ()
     processMQError s = fmap fst . flip runMQMonadS s . flip catchError (errorHandler name')
