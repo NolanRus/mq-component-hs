@@ -6,14 +6,19 @@ module Main where
 import           Control.Monad                          (when)
 import           Control.Monad.IO.Class                 (liftIO)
 import           ExampleRadioTypes                      (RadioData (..))
-import           System.MQ.Component                    (Env (..), runComponent)
+import           System.MQ.Component                    (Env (..), runComponent, ConnectionHandler (..))
 import           System.MQ.Monad
 import           System.MQ.Protocol
 import           Control.Concurrent.Chan.Unagi          (InChan, OutChan, readChan)
 import           System.Log.Logger                      (infoM)
 
 main :: IO ()
-main = runComponent "example_radio-listener-hs" () app
+main = runComponent "example_radio-listener-hs" () appHandler
+  where
+    appHandler = ConnectionHandler app [(mtype messageProps, spec messageProps)]
+
+    messageProps :: Props RadioData
+    messageProps = props 
 
 app :: Env -> OutChan (MessageTag, Message) -> InChan Message -> MQMonad ()
 app Env{..} outChan _ = do

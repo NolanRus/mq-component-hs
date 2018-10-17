@@ -12,6 +12,7 @@ module System.MQ.Component.Internal.App
   , runComponentWithCustomTech
   , processKill
   , processMonitoring
+  , ConnectionHandler (..)
   ) where
 
 import           Data.Function                                     (fix)
@@ -57,11 +58,11 @@ import           System.MQ.Monad                                   (MQMonad,
                                                                     foreverSafe)
 import           System.MQ.Protocol                                (Message (..), MessageTag, Condition (..),
                                                                     Props (..), props, messageSpec, messageType,
-                                                                    MessageType (..), matches, unpackM,
+                                                                    MessageType (..), Spec, matches, unpackM,
                                                                     createMessage, emptyId,
                                                                     getTimeMillis, notExpires)
 import           System.MQ.Protocol.Technical                      (KillConfig (..), MonitoringData (..))
-import           System.MQ.Transport                               (SubChannel, PushChannel, sub, push, subscribeToTypeSpec)
+import           System.MQ.Transport                               (SubChannel, sub, push, subscribeToTypeSpec)
 
 
 runApp :: Name -> (Env -> MQMonad ()) -> IO ()
@@ -72,6 +73,13 @@ runAppS name' state runComm = runAppWithTechS name' state runComm runTech
 
 runAppWithTech :: Name -> (Env -> MQMonad ()) -> (Env -> MQMonad ()) -> IO ()
 runAppWithTech name' = runAppWithTechS name' ()
+
+setupLogger :: Env -> IO ()
+setupLogger Env{..} = do
+    h <- fileHandler logfile INFO >>= \lh -> return $
+             setFormatter lh (simpleLogFormatter "[$time : $loggername : $prio] $msg")
+    updateGlobalLogger name (addHandler h)
+    updateGlobalLogger name (setLevel INFO)
 
 runAppWithTechS :: forall s. Name -> s -> (Env -> MQMonadS s ()) -> (Env -> MQMonad ()) -> IO ()
 runAppWithTechS name' state runComm runCustomTech = do
@@ -100,13 +108,6 @@ runAppWithTechS name' state runComm runCustomTech = do
     processMQError :: p -> MQMonadS p () -> IO ()
     processMQError state' = fmap fst . flip runMQMonadS state' . flip catchError (errorHandler name')
 
-    setupLogger :: Env -> IO ()
-    setupLogger Env{..} = do
-        h <- fileHandler logfile INFO >>= \lh -> return $
-                 setFormatter lh (simpleLogFormatter "[$time : $loggername : $prio] $msg")
-        updateGlobalLogger name (addHandler h)
-        updateGlobalLogger name (setLevel INFO)
-
     oneSecond :: Int
     oneSecond = 10^(6 :: Int)
 
@@ -115,7 +116,11 @@ runTech env@Env{..} = do
     _ <- liftIO . forkIO . runMQMonad $ processKill env
     processMonitoring env
 
-type ConnectionHandler s = Env -> OutChan (MessageTag, Message) -> InChan Message -> MQMonadS s ()
+data ConnectionHandler s 
+    = ConnectionHandler 
+    { handleConnection :: Env -> OutChan (MessageTag, Message) -> InChan Message -> MQMonadS s ()
+    , typeSpecs :: [(MessageType, Spec)]
+    }
 
 handleMQError :: Env -> s -> MQMonadS s () -> IO ()
 handleMQError Env{..} state' computation = do
@@ -124,8 +129,10 @@ handleMQError Env{..} state' computation = do
     pure ()
 
 runComponent :: Name -> s -> ConnectionHandler s -> IO ()
-runComponent name' state' runComm = runComponentWithCustomTech name' state' runComm runDefaultTechHandler
+runComponent name' state' runComm = runComponentWithCustomTech name' state' runComm defaultTechHandler
   where
+    defaultTechHandler = ConnectionHandler runDefaultTechHandler [(Config, spec (props :: Props KillConfig))]
+
     runDefaultTechHandler :: Env -> OutChan (MessageTag, Message) -> InChan Message -> MQMonadS () ()
     runDefaultTechHandler env outChan inChan = do
         _ <- liftIO $ forkIO $ handleMQError env () $ handleKillMessages env outChan
@@ -173,39 +180,44 @@ runComponentWithCustomTech name' state' runComm runCustomTech = do
     (incomingIn, incomingOut) <- liftIO newChan
     (outgoingCommIn, outgoingCommOut) <- liftIO newChan
     (outgoingTechIn, outgoingTechOut) <- liftIO newChan
-    -- | Collectors
-    -- | This should be done in a different way of course. Purhaps it's better
-    -- to create class for message handler. It should tell what topics we need
-    -- to subscribe to.
-    let openConnectionFromScheduler = do
-            fromScheduler <- openCommunicationalConnectionFromScheduler 
-            subscribeToTypeSpec fromScheduler Data "example_radio" 
-            pure fromScheduler
-    let openConnections = [openConnectionFromScheduler, openTechnicalConnectionFromScheduler]
-    forM_ openConnections $ \openConnection ->
+    (commIn, commOut) <- liftIO newChan 
+    (techIn, techOut) <- liftIO newChan
+    -- Collectors.
+    -- Collectors are threads that collect messages from both communicational
+    -- and technical channel and push them into single queue called `incoming`
+    -- Later they are taken from this queue by dispatcher.
+    let openConnections = 
+            [(openCommunicationalConnectionFromScheduler, typeSpecs runComm), 
+             (openTechnicalConnectionFromScheduler, typeSpecs runCustomTech)]
+    forM_ openConnections $ \(openConnection, typeSpecs) ->
         liftIO $ forkIO $ handleMQError env () $ do
             fromScheduler <- liftIO openConnection
+            forM_ typeSpecs $ \(type', spec) ->
+                subscribeToTypeSpec fromScheduler type' spec   
             fix $ \action -> do
                 message <- sub fromScheduler
                 liftIO $ writeChan incomingIn message
                 action
     let outgoing = [(openCommunicationalConnectionToScheduler, outgoingCommOut), 
                     (openTechnicalConnectionToScheduler, outgoingTechOut)] 
-    forM_ outgoing $ \(openConnection, channel) -> do
+    forM_ outgoing $ \(openConnection, channel) -> 
         liftIO $ forkIO $ handleMQError env () $ do
             toScheduler <- liftIO openConnection
             fix $ \action -> do
                 message <- liftIO $ readChan channel
                 push toScheduler message
                 action
-    -- | Handlers
-    (commIn, commOut) <- liftIO newChan
-    liftIO $ forkIO $ handleMQError env state' $ do
-        runComm env commOut outgoingCommIn
-    (techIn, techOut) <- liftIO newChan
-    liftIO $ forkIO $ handleMQError env () $ do
-        runCustomTech env techOut outgoingTechIn
-    -- | Dispatcher
+    -- Handlers.
+    -- Handlers are thread that know how to act on the messages of specific
+    -- type. For now there are only two kinds of messages: technical and communicational
+    -- thus two threads are started here.
+    _ <- liftIO $ forkIO $ handleMQError env state' $
+        handleConnection runComm env commOut outgoingCommIn
+    _ <- liftIO $ forkIO $ handleMQError env () $
+        handleConnection runCustomTech env techOut outgoingTechIn
+    -- Dispatcher.
+    -- Dispatcher is a thread that determines which handler should receive
+    -- message.
     fix $ \action -> do
         message@(tag, _) <- liftIO $ readChan incomingOut
         let checkTag = (`matches` (messageSpec :== spec (props :: Props KillConfig) 
@@ -213,13 +225,3 @@ runComponentWithCustomTech name' state' runComm runCustomTech = do
         let channel = if checkTag tag then techIn else commIn
         liftIO $ writeChan channel message
         action
-  where
-    processMQError :: s -> MQMonadS s () -> IO ()
-    processMQError s = fmap fst . flip runMQMonadS s . flip catchError (errorHandler name')
-
-    setupLogger :: Env -> IO ()
-    setupLogger Env{..} = do
-        h <- fileHandler logfile INFO >>= \lh -> return $
-                 setFormatter lh (simpleLogFormatter "[$time : $loggername : $prio] $msg")
-        updateGlobalLogger name (addHandler h)
-        updateGlobalLogger name (setLevel INFO)
