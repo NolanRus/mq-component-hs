@@ -32,21 +32,21 @@ import           System.MQ.Transport              (ConnectTo (..), Context,
 import           System.MQ.Transport              (PushChannel, SubChannel)
 
 openCommunicationalConnectionToScheduler :: IO PushChannel
-openCommunicationalConnectionToScheduler = openConnection comport
+openCommunicationalConnectionToScheduler = openConnection comport schedulerInFromConfig
 
 openCommunicationalConnectionFromScheduler :: IO SubChannel
-openCommunicationalConnectionFromScheduler = openConnection comport
+openCommunicationalConnectionFromScheduler = openConnection comport schedulerOutFromConfig
 
 openTechnicalConnectionToScheduler :: IO PushChannel
-openTechnicalConnectionToScheduler = openConnection techport
+openTechnicalConnectionToScheduler = openConnection techport schedulerInFromConfig
 
 openTechnicalConnectionFromScheduler :: IO SubChannel
-openTechnicalConnectionFromScheduler = openConnection techport 
+openTechnicalConnectionFromScheduler = openConnection techport schedulerOutFromConfig
 
-openConnection :: ConnectTo a => (SchedulerCfg -> Port) -> IO a
-openConnection portFromConfig = do
+openConnection :: ConnectTo a => (SchedulerCfg -> Port) -> IO SchedulerCfg -> IO a
+openConnection portFromConfig getConfig = do
     context' <- contextM
-    config@SchedulerCfg{..} <- schedulerOutFromConfig
+    config@SchedulerCfg{..} <- getConfig
     connectTo (HostPort host (portFromConfig config)) context'
 
 loadEnv :: Name -> IO Env

@@ -22,8 +22,6 @@ main = runComponent "example_radio-listener-hs" () appHandler
 
 app :: Env -> OutChan (MessageTag, Message) -> InChan Message -> MQMonad ()
 app Env{..} outChan _ = do
-  -- We can't subscribe to specific topic so far, so we're just receiveing all messages.
-  -- subscribeToTypeSpec from (mtype messageProps) (spec messageProps)
   liftIO $ infoM name "App is started"
   foreverSafe name $ do
       -- receive message
